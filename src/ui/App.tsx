@@ -152,6 +152,12 @@ function ProviderPreview({ provider }: ProviderPreviewProps) {
         {provider.appType === 'codex' && <Text dimColor> (codex)</Text>}
       </Text>
       <Text dimColor>{'─'.repeat(38)}</Text>
+      {provider.selectionDisabledReason && (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text color="yellow">Unsupported</Text>
+          <Text dimColor>{provider.selectionDisabledReason}</Text>
+        </Box>
+      )}
 
       {/* Claude env vars */}
       {envKeys.length > 0 && envKeys.map((key) => (
@@ -222,6 +228,10 @@ export function App({ providers, onSelect }: AppProps) {
   // Handle selection
   const handleSelect = useCallback(
     (provider: Provider) => {
+      if (provider.selectionDisabledReason) {
+        return;
+      }
+
       onSelect(provider);
       exit();
     },
@@ -246,7 +256,7 @@ export function App({ providers, onSelect }: AppProps) {
           setSelectedIndex((prev) =>
             Math.min(filteredProviders.length - 1, prev + pageSize)
           );
-        } else if (key.return && selectedProvider) {
+        } else if (key.return && selectedProvider && !selectedProvider.selectionDisabledReason) {
           handleSelect(selectedProvider);
         } else if (key.escape) {
           exit();
@@ -306,11 +316,19 @@ export function App({ providers, onSelect }: AppProps) {
               <Box key={provider.id}>
                 <Text
                   bold={isSelected}
-                  color={isSelected ? 'green' : undefined}
+                  color={
+                    provider.selectionDisabledReason
+                      ? 'gray'
+                      : isSelected
+                        ? 'green'
+                        : undefined
+                  }
+                  dimColor={Boolean(provider.selectionDisabledReason)}
                   inverse={isSelected}
                 >
                   {isSelected ? '❯ ' : '  '}
                   {provider.name}
+                  {provider.selectionDisabledReason && ' (unsupported)'}
                 </Text>
               </Box>
             );

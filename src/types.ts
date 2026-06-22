@@ -8,6 +8,7 @@ export interface Provider {
   settingsConfig: Record<string, unknown>;
   appType: AppType;
   apiFormat?: string;
+  selectionDisabledReason?: string;
 }
 
 export interface ProviderRow {

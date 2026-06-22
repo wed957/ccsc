@@ -8,7 +8,7 @@ import { render } from 'ink';
 import React from 'react';
 import { Command } from 'commander';
 import { App } from './ui/App.js';
-import { getProviders, isDbAvailable, getProxyConfig, setCurrentProvider, setAutoFailover, isProxyRunning, getCurrentProviderId, getAutoFailoverEnabled, restoreProxyState } from './db.js';
+import { getProviders, isDbAvailable, getProxyConfig, isProxyRunning, getCurrentProviderId, getAutoFailoverEnabled } from './db.js';
 import { loadHistory, saveToHistory, sortByHistory } from './history.js';
 import { createProviderSettings, clearAllCcscSettings } from './settings.js';
 import { createProviderConfig, clearAllCcscCodexConfigs } from './codex-settings.js';
@@ -113,7 +113,7 @@ async function main(args: string[], type: AppType = 'claude'): Promise<void> {
     process.exit(1);
   }
 
-  const providers = getProviders(type);
+  const providers = await getSelectableProviders(getProviders(type));
 
   if (providers.length === 0) {
     console.error(`No ${type} providers found in CC Switch.`);
@@ -151,93 +151,86 @@ async function main(args: string[], type: AppType = 'claude'): Promise<void> {
   }
 }
 
-// Track proxy state changes for cleanup on exit
-let proxyCleanup: { appType: AppType; previousProviderId: string | null; previousAutoFailover: boolean } | null = null;
-
-/**
- * Restore cc-switch proxy state to what it was before CCSC made changes.
- */
-function cleanupProxyState(exitCode?: number): void {
-  if (!proxyCleanup) return;
-
-  const { appType, previousProviderId, previousAutoFailover } = proxyCleanup;
-  proxyCleanup = null;
-
-  try {
-    restoreProxyState(appType, previousProviderId, previousAutoFailover);
-  } catch {
-    // Best-effort cleanup
-  }
-
-  if (exitCode !== undefined) {
-    process.exit(exitCode);
-  }
-}
-
-// Restore proxy state on force-quit (Ctrl+C, kill, etc.)
-process.on('exit', () => {
-  cleanupProxyState();
-});
-
 /**
  * Launch Claude Code with the selected provider
  *
  * For non-Anthropic API formats (openai_chat, openai_responses):
- *   - Only routes through proxy if it's already running (no auto-start)
- *   - Disables auto-failover globally so proxy routes to our selected provider
- *   - Restores original state (is_current, auto_failover) when Claude exits
+ *   - Requires enabled and running cc-switch Claude proxy routing
+ *   - Requires auto-failover to already be disabled
+ *   - Requires cc-switch is_current to already point at the selected provider
  *
  * For anthropic format providers: original behavior unchanged.
  */
-async function launchClaude(provider: Provider, claudeArgs: string[]): Promise<void> {
-  // Only apply proxy routing for non-Anthropic API formats
-  if (provider.apiFormat && provider.apiFormat !== 'anthropic') {
-    const proxyConfig = getProxyConfig(provider.appType);
+function requiresProxyRouting(provider: Provider): boolean {
+  return provider.appType === 'claude' && Boolean(provider.apiFormat && provider.apiFormat !== 'anthropic');
+}
 
-    if (proxyConfig) {
-      // Only proceed if proxy is actually reachable
-      if (await isProxyRunning(proxyConfig.address, proxyConfig.port)) {
-        // Save current state before making changes
-        const previousProviderId = getCurrentProviderId(provider.appType);
-        const previousAutoFailover = getAutoFailoverEnabled(provider.appType);
-
-        // Disable auto-failover so proxy doesn't override our provider selection
-        setAutoFailover(provider.appType, false);
-
-        // Set current provider for proxy routing
-        setCurrentProvider(provider.appType, provider.id);
-
-        // Store cleanup info
-        proxyCleanup = {
-          appType: provider.appType,
-          previousProviderId,
-          previousAutoFailover,
-        };
-
-        // Generate settings with proxy URL
-        const proxyAddress = `http://${proxyConfig.address}:${proxyConfig.port}`;
-        const settingsPath = await createProviderSettings(
-          provider.name,
-          provider.envVars,
-          provider.settingsConfig,
-          provider.apiFormat,
-          proxyAddress
-        );
-
-        const finalArgs = [`--settings=${settingsPath}`, ...claudeArgs];
-        console.log(`🚀 Starting Claude with provider: ${provider.name} (via proxy)`);
-
-        // Spawn Claude and restore state when it exits
-        const child = await spawnCli('claude', finalArgs, provider.envVars);
-        child.on('exit', (code) => {
-          cleanupProxyState(code ?? undefined);
-        });
-        return;
-      }
-    }
+async function getProxyRoutingDisabledReason(provider: Provider): Promise<string | undefined> {
+  if (!requiresProxyRouting(provider)) {
+    return undefined;
   }
 
-  // Original logic for anthropic providers or when proxy is unavailable
+  const proxyConfig = getProxyConfig(provider.appType);
+  if (!proxyConfig) {
+    return 'Requires cc-switch proxy routing, but routing is disabled.';
+  }
+
+  if (getAutoFailoverEnabled(provider.appType)) {
+    return 'Requires cc-switch proxy routing, but auto-failover is enabled.';
+  }
+
+  if (!(await isProxyRunning(proxyConfig.address, proxyConfig.port))) {
+    return 'Requires cc-switch proxy routing, but the proxy is not running.';
+  }
+
+  if (getCurrentProviderId(provider.appType) !== provider.id) {
+    return 'Requires cc-switch proxy routing, but this provider is not the current cc-switch provider.';
+  }
+
+  return undefined;
+}
+
+async function getSelectableProviders(providers: Provider[]): Promise<Provider[]> {
+  return Promise.all(
+    providers.map(async (provider) => ({
+      ...provider,
+      selectionDisabledReason: await getProxyRoutingDisabledReason(provider),
+    }))
+  );
+}
+
+async function launchClaude(provider: Provider, claudeArgs: string[]): Promise<void> {
+  // Only apply proxy routing for non-Anthropic API formats
+  if (requiresProxyRouting(provider)) {
+    const disabledReason = await getProxyRoutingDisabledReason(provider);
+    if (disabledReason) {
+      throw new Error(`${provider.name} cannot be selected. ${disabledReason}`);
+    }
+
+    const proxyConfig = getProxyConfig(provider.appType);
+
+    if (!proxyConfig) {
+      throw new Error(`${provider.name} cannot be selected. Requires cc-switch proxy routing, but routing is disabled.`);
+    }
+
+    // Generate settings with proxy URL
+    const proxyAddress = `http://${proxyConfig.address}:${proxyConfig.port}`;
+    const settingsPath = await createProviderSettings(
+      provider.name,
+      provider.envVars,
+      provider.settingsConfig,
+      provider.apiFormat,
+      proxyAddress
+    );
+
+    const finalArgs = [`--settings=${settingsPath}`, ...claudeArgs];
+    console.log(`🚀 Starting Claude with provider: ${provider.name} (via proxy)`);
+
+    await spawnCli('claude', finalArgs, provider.envVars);
+    return;
+  }
+
+  // Original logic for anthropic providers
   const settingsPath = await createProviderSettings(
     provider.name,
     provider.envVars,
