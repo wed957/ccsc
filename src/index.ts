@@ -8,7 +8,7 @@ import { render } from 'ink';
 import React from 'react';
 import { Command } from 'commander';
 import { App } from './ui/App.js';
-import { getProviders, isDbAvailable } from './db.js';
+import { getProviders, isDbAvailable, getProxyConfig, setCurrentProvider, setAutoFailover, isProxyRunning, getCurrentProviderId, getAutoFailoverEnabled, restoreProxyState } from './db.js';
 import { loadHistory, saveToHistory, sortByHistory } from './history.js';
 import { createProviderSettings, clearAllCcscSettings } from './settings.js';
 import { createProviderConfig, clearAllCcscCodexConfigs } from './codex-settings.js';
@@ -151,10 +151,93 @@ async function main(args: string[], type: AppType = 'claude'): Promise<void> {
   }
 }
 
+// Track proxy state changes for cleanup on exit
+let proxyCleanup: { appType: AppType; previousProviderId: string | null; previousAutoFailover: boolean } | null = null;
+
+/**
+ * Restore cc-switch proxy state to what it was before CCSC made changes.
+ */
+function cleanupProxyState(exitCode?: number): void {
+  if (!proxyCleanup) return;
+
+  const { appType, previousProviderId, previousAutoFailover } = proxyCleanup;
+  proxyCleanup = null;
+
+  try {
+    restoreProxyState(appType, previousProviderId, previousAutoFailover);
+  } catch {
+    // Best-effort cleanup
+  }
+
+  if (exitCode !== undefined) {
+    process.exit(exitCode);
+  }
+}
+
+// Restore proxy state on force-quit (Ctrl+C, kill, etc.)
+process.on('exit', () => {
+  cleanupProxyState();
+});
+
 /**
  * Launch Claude Code with the selected provider
+ *
+ * For non-Anthropic API formats (openai_chat, openai_responses):
+ *   - Only routes through proxy if it's already running (no auto-start)
+ *   - Disables auto-failover globally so proxy routes to our selected provider
+ *   - Restores original state (is_current, auto_failover) when Claude exits
+ *
+ * For anthropic format providers: original behavior unchanged.
  */
 async function launchClaude(provider: Provider, claudeArgs: string[]): Promise<void> {
+  // Only apply proxy routing for non-Anthropic API formats
+  if (provider.apiFormat && provider.apiFormat !== 'anthropic') {
+    const proxyConfig = getProxyConfig(provider.appType);
+
+    if (proxyConfig) {
+      // Only proceed if proxy is actually reachable
+      if (await isProxyRunning(proxyConfig.address, proxyConfig.port)) {
+        // Save current state before making changes
+        const previousProviderId = getCurrentProviderId(provider.appType);
+        const previousAutoFailover = getAutoFailoverEnabled(provider.appType);
+
+        // Disable auto-failover so proxy doesn't override our provider selection
+        setAutoFailover(provider.appType, false);
+
+        // Set current provider for proxy routing
+        setCurrentProvider(provider.appType, provider.id);
+
+        // Store cleanup info
+        proxyCleanup = {
+          appType: provider.appType,
+          previousProviderId,
+          previousAutoFailover,
+        };
+
+        // Generate settings with proxy URL
+        const proxyAddress = `http://${proxyConfig.address}:${proxyConfig.port}`;
+        const settingsPath = await createProviderSettings(
+          provider.name,
+          provider.envVars,
+          provider.settingsConfig,
+          provider.apiFormat,
+          proxyAddress
+        );
+
+        const finalArgs = [`--settings=${settingsPath}`, ...claudeArgs];
+        console.log(`🚀 Starting Claude with provider: ${provider.name} (via proxy)`);
+
+        // Spawn Claude and restore state when it exits
+        const child = await spawnCli('claude', finalArgs, provider.envVars);
+        child.on('exit', (code) => {
+          cleanupProxyState(code ?? undefined);
+        });
+        return;
+      }
+    }
+  }
+
+  // Original logic for anthropic providers or when proxy is unavailable
   const settingsPath = await createProviderSettings(
     provider.name,
     provider.envVars,
@@ -167,13 +250,6 @@ async function launchClaude(provider: Provider, claudeArgs: string[]): Promise<v
 
   await spawnCli('claude', finalArgs, provider.envVars);
 }
-
-/**
- * Launch Codex CLI with the selected provider
- *
- * Uses CODEX_HOME isolation: each provider gets its own directory
- * under ~/.ccsc/codex-{slug}/ containing auth.json + config.toml.
- */
 async function launchCodex(provider: Provider, codexArgs: string[]): Promise<void> {
   const config = provider.settingsConfig;
   const authVars = getRecord(config.auth) || {};
@@ -197,7 +273,7 @@ function getRecord(value: unknown): Record<string, unknown> | undefined {
 /**
  * Spawn a CLI process through the user's login shell
  */
-async function spawnCli(bin: string, args: string[], envVars: Record<string, string>): Promise<void> {
+async function spawnCli(bin: string, args: string[], envVars: Record<string, string>): Promise<import('child_process').ChildProcess> {
   const userShell = process.env.SHELL;
 
   // Resolve binary to absolute path via login shell
@@ -240,4 +316,6 @@ async function spawnCli(bin: string, args: string[], envVars: Record<string, str
   child.on('exit', (code) => {
     process.exit(code || 0);
   });
+
+  return child;
 }

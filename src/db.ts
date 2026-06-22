@@ -3,8 +3,8 @@ const { Database } = NodeSqlite;
 import path from 'path';
 import os from 'os';
 import { existsSync } from 'fs';
+import net from 'net';
 import type { Provider, ProviderRow, AppType } from './types.js';
-
 /**
  * Get the CC Switch database path
  * Priority:
@@ -110,6 +110,177 @@ export function getCommonConfigRaw(appType: string): string {
 }
 
 /**
+ * Get proxy config for a given app type
+ * Returns {address, port} if proxy is enabled, null otherwise
+ */
+export function getProxyConfig(appType: AppType): { address: string; port: number } | null {
+  const dbPath = getDbPath();
+  if (!existsSync(dbPath)) return null;
+
+  const db = new Database(dbPath);
+  try {
+    const row = db.get(
+      "SELECT listen_address, listen_port, enabled FROM proxy_config WHERE app_type = ?",
+      [appType]
+    ) as { listen_address: string; listen_port: number; enabled: number } | undefined;
+
+    if (!row || row.enabled !== 1) return null;
+    return { address: row.listen_address, port: row.listen_port };
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Update the is_current flag for a provider so the cc-switch proxy routes correctly.
+ * Sets all providers of the same app_type to is_current = 0, then sets the
+ * selected provider to is_current = 1.
+ */
+export function setCurrentProvider(appType: AppType, providerId: string): void {
+  const dbPath = getDbPath();
+  if (!existsSync(dbPath)) return;
+
+  const db = new Database(dbPath);
+  try {
+    db.run(
+      'UPDATE providers SET is_current = 0 WHERE app_type = ?',
+      [appType]
+    );
+    db.run(
+      'UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = ?',
+      [providerId, appType]
+    );
+  } catch {
+    // Silently ignore errors
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Check if the cc-switch proxy is accepting connections on the given address:port
+ */
+export async function isProxyRunning(address: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      resolve(false);
+    }, 2000);
+
+    socket.connect(port, address, () => {
+      clearTimeout(timeout);
+      socket.end();
+      resolve(true);
+    });
+
+    socket.on('error', () => {
+      clearTimeout(timeout);
+      resolve(false);
+    });
+  });
+}
+
+/**
+ * Enable or disable auto-failover for a given app type in cc-switch proxy config
+ */
+export function setAutoFailover(appType: AppType, enabled: boolean): void {
+  const dbPath = getDbPath();
+  if (!existsSync(dbPath)) return;
+
+  const db = new Database(dbPath);
+  try {
+    db.run(
+      'UPDATE proxy_config SET auto_failover_enabled = ? WHERE app_type = ?',
+      [enabled ? 1 : 0, appType]
+    );
+  } catch {
+    // Silently ignore errors
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Get the currently active provider ID for an app type (is_current = 1)
+ */
+export function getCurrentProviderId(appType: AppType): string | null {
+  const dbPath = getDbPath();
+  if (!existsSync(dbPath)) return null;
+
+  const db = new Database(dbPath);
+  try {
+    const row = db.get(
+      'SELECT id FROM providers WHERE app_type = ? AND is_current = 1 LIMIT 1',
+      [appType]
+    ) as { id: string } | undefined;
+    return row?.id || null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Get the current auto_failover_enabled value for an app type
+ */
+export function getAutoFailoverEnabled(appType: AppType): boolean {
+  const dbPath = getDbPath();
+  if (!existsSync(dbPath)) return false;
+
+  const db = new Database(dbPath);
+  try {
+    const row = db.get(
+      'SELECT auto_failover_enabled FROM proxy_config WHERE app_type = ?',
+      [appType]
+    ) as { auto_failover_enabled: number } | undefined;
+    return row?.auto_failover_enabled === 1;
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Restore proxy state: set is_current back to a specific provider and
+ * restore auto_failover_enabled. Used to clean up after CCSC finishes.
+ */
+export function restoreProxyState(
+  appType: AppType,
+  previousProviderId: string | null,
+  previousAutoFailover: boolean
+): void {
+  const dbPath = getDbPath();
+  if (!existsSync(dbPath)) return;
+
+  const db = new Database(dbPath);
+  try {
+    // Restore is_current
+    if (previousProviderId) {
+      db.run('UPDATE providers SET is_current = 0 WHERE app_type = ?', [appType]);
+      db.run(
+        'UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = ?',
+        [previousProviderId, appType]
+      );
+    }
+
+    // Restore auto_failover
+    db.run(
+      'UPDATE proxy_config SET auto_failover_enabled = ? WHERE app_type = ?',
+      [previousAutoFailover ? 1 : 0, appType]
+    );
+  } catch {
+    // Silently ignore errors
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * Get all providers for a given app type from CC Switch database
  */
 export function getProviders(appType: AppType = 'claude'): Provider[] {
@@ -127,14 +298,14 @@ export function getProviders(appType: AppType = 'claude'): Provider[] {
 
   try {
     const rows = db.all(
-      `SELECT id, name, settings_config
+      `SELECT id, name, settings_config, json_extract(meta, '$.apiFormat') as api_format
        FROM providers
        WHERE app_type = ?
        ORDER BY name`,
       [appType]
-    ) as unknown as ProviderRow[];
+    ) as unknown as (ProviderRow & { api_format: string | null })[];
 
-    return rows.map((row) => parseProvider(row, commonEnv, appType));
+    return rows.map((row) => parseProvider(row, commonEnv, appType, row.api_format || undefined));
   } finally {
     db.close();
   }
@@ -146,7 +317,8 @@ export function getProviders(appType: AppType = 'claude'): Provider[] {
 function parseProvider(
   row: ProviderRow,
   commonEnv: Record<string, string>,
-  appType: AppType = 'claude'
+  appType: AppType = 'claude',
+  apiFormat?: string
 ): Provider {
   let config: { env?: Record<string, string>; [key: string]: unknown } = {};
 
@@ -166,6 +338,7 @@ function parseProvider(
     envVars: mergedEnv,
     settingsConfig: config,
     appType,
+    apiFormat,
   };
 }
 

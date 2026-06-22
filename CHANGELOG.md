@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepchangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-22
+
+### Added
+- Proxy routing for non-Anthropic API format providers (openai_chat, openai_responses)
+- Auto-disable cc-switch proxy auto-failover when CCSC takes over routing
+- Save and restore cc-switch DB state (is_current, auto_failover_enabled) on Claude exit
+
+### Changed
+- Provider.id type changed from number to string (matches SQLite TEXT schema)
+- Added apiFormat field to Provider interface for API format detection
+
 ## [1.2.1] - 2026-06-06
 
 ### Fixed

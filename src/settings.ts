@@ -89,11 +89,14 @@ function getProviderSettingsPath(providerName: string): string {
  * 5. Merge common_config_claude.env from database
  * 6. Merge provider settings_config.env (highest priority)
  * 7. Merge provider's other config fields (teammateMode, model, etc.)
+ * 8. If apiFormat is not 'anthropic', route ANTHROPIC_BASE_URL through cc-switch proxy
  */
 export async function createProviderSettings(
   providerName: string,
   providerEnv: Record<string, string>,
-  providerConfig?: Record<string, unknown>
+  providerConfig?: Record<string, unknown>,
+  apiFormat?: string,
+  proxyAddress?: string
 ): Promise<string> {
   await ensureClaudeDir();
 
@@ -156,6 +159,11 @@ export async function createProviderSettings(
         (settings as Record<string, unknown>)[key] = value;
       }
     }
+  }
+
+  // 8. Route through cc-switch proxy for non-Anthropic API formats
+  if (apiFormat && apiFormat !== 'anthropic' && proxyAddress) {
+    settings.env.ANTHROPIC_BASE_URL = proxyAddress;
   }
 
   // Write back
