@@ -1,0 +1,80 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Daily ~02:17 UTC (avoid :00/:30 stampede)
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Hard-reset to upstream and restore this workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          BRANCH="${{ github.event.repository.default_branch }}"
+          WORKFLOW_PATH=".github/workflows/sync-upstream.yml"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          PARENT="$(gh api "repos/${REPO}" --jq .parent.full_name)"
+          if [ -z "$PARENT" ] || [ "$PARENT" = "null" ]; then
+            echo "Not a fork (no parent); nothing to sync."
+            exit 0
+          fi
+
+          echo "Repository : $REPO"
+          echo "Branch     : $BRANCH"
+          echo "Upstream   : $PARENT"
+
+          # Keep a copy of this workflow before the hard reset wipes it.
+          if [ ! -f "$WORKFLOW_PATH" ]; then
+            echo "Missing $WORKFLOW_PATH in the checked-out commit."
+            exit 1
+          fi
+          cp "$WORKFLOW_PATH" /tmp/sync-upstream.yml
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${PARENT}.git"
+          git fetch --no-tags upstream "$BRANCH"
+
+          BEFORE="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse "upstream/${BRANCH}")"
+          echo "Before     : $BEFORE"
+          echo "Upstream   : $UPSTREAM_SHA"
+
+          git checkout -B "$BRANCH" "upstream/${BRANCH}"
+          mkdir -p .github/workflows
+          cp /tmp/sync-upstream.yml "$WORKFLOW_PATH"
+          # Some upstreams gitignore .github/workflows (e.g. terranc/ccsc).
+          git add -f "$WORKFLOW_PATH"
+
+          if git diff --cached --quiet; then
+            echo "Workflow already present on upstream tip; force-pushing hard reset only."
+          else
+            git commit -m "ci: keep sync-upstream workflow after hard-reset to ${PARENT}@${BRANCH}"
+          fi
+
+          AFTER="$(git rev-parse HEAD)"
+          echo "After      : $AFTER"
+
+          git push --force origin "HEAD:refs/heads/${BRANCH}"
+          echo "Force-pushed $BRANCH -> matches upstream plus workflow restore commit."
